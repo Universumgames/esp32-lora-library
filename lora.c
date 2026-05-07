@@ -319,9 +319,9 @@ lora_init(void)
    /*
     * Configure CPU hardware to communicate with the radio chip
     */
-   gpio_pad_select_gpio(CONFIG_RST_GPIO);
+   gpio_reset_pin(CONFIG_RST_GPIO);
    gpio_set_direction(CONFIG_RST_GPIO, GPIO_MODE_OUTPUT);
-   gpio_pad_select_gpio(CONFIG_CS_GPIO);
+   gpio_reset_pin(CONFIG_CS_GPIO);
    gpio_set_direction(CONFIG_CS_GPIO, GPIO_MODE_OUTPUT);
 
    spi_bus_config_t bus = {
@@ -333,7 +333,7 @@ lora_init(void)
       .max_transfer_sz = 0
    };
            
-   ret = spi_bus_initialize(VSPI_HOST, &bus, 0);
+   ret = spi_bus_initialize(SPI3_HOST, &bus, 0);
    assert(ret == ESP_OK);
 
    spi_device_interface_config_t dev = {
@@ -344,7 +344,7 @@ lora_init(void)
       .flags = 0,
       .pre_cb = NULL
    };
-   ret = spi_bus_add_device(VSPI_HOST, &dev, &__spi);
+   ret = spi_bus_add_device(SPI3_HOST, &dev, &__spi);
    assert(ret == ESP_OK);
 
    /*
