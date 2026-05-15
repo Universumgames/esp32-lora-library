@@ -1,11 +1,13 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_system.h"
+#include "freertos/semphr.h"
 #include "driver/spi_master.h"
 #include "soc/gpio_struct.h"
 #include "driver/gpio.h"
+#include "esp_log.h"
 #include <string.h>
+#include <stdbool.h>
 
 /*
  * Register definitions
@@ -60,6 +62,8 @@
 #define IRQ_PAYLOAD_CRC_ERROR_MASK     0x20
 #define IRQ_RX_DONE_MASK               0x40
 
+#define LORA_TX_TIMEOUT_MS             3000
+
 #define PA_OUTPUT_RFO_PIN              0
 #define PA_OUTPUT_PA_BOOST_PIN         1
 
@@ -69,6 +73,25 @@ static spi_device_handle_t __spi;
 
 static int __implicit;
 static long __frequency;
+static bool __initialized;
+static const char *TAG = "lora";
+static SemaphoreHandle_t __spi_mutex = NULL;
+
+static bool lora_spi_transmit(spi_transaction_t* t)
+{
+   if (__spi == NULL) {
+      ESP_LOGE(TAG, "SPI device is not initialized");
+      return false;
+   }
+
+   esp_err_t ret = spi_device_transmit(__spi, t);
+   if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "spi_device_transmit failed: %s", esp_err_to_name(ret));
+      return false;
+   }
+
+   return true;
+}
 
 /**
  * Write a value to a register.
@@ -85,12 +108,14 @@ lora_write_reg(int reg, int val)
       .flags = 0,
       .length = 8 * sizeof(out),
       .tx_buffer = out,
-      .rx_buffer = in  
+      .rx_buffer = in
    };
 
+   if (__spi_mutex) xSemaphoreTake(__spi_mutex, portMAX_DELAY);
    gpio_set_level(CONFIG_CS_GPIO, 0);
-   spi_device_transmit(__spi, &t);
+   (void)lora_spi_transmit(&t);
    gpio_set_level(CONFIG_CS_GPIO, 1);
+   if (__spi_mutex) xSemaphoreGive(__spi_mutex);
 }
 
 /**
@@ -111,9 +136,15 @@ lora_read_reg(int reg)
       .rx_buffer = in
    };
 
+   if (__spi_mutex) xSemaphoreTake(__spi_mutex, portMAX_DELAY);
    gpio_set_level(CONFIG_CS_GPIO, 0);
-   spi_device_transmit(__spi, &t);
+   if (!lora_spi_transmit(&t)) {
+      gpio_set_level(CONFIG_CS_GPIO, 1);
+      if (__spi_mutex) xSemaphoreGive(__spi_mutex);
+      return -1;
+   }
    gpio_set_level(CONFIG_CS_GPIO, 1);
+   if (__spi_mutex) xSemaphoreGive(__spi_mutex);
    return in[1];
 }
 
@@ -314,7 +345,15 @@ lora_disable_crc(void)
 int 
 lora_init(void)
 {
+   if (__initialized) {
+      return 1;
+   }
+
    esp_err_t ret;
+
+   ESP_LOGI(TAG, "Initializing LoRa module");
+
+   ESP_LOGI(TAG, "Configuring GPIO");
 
    /*
     * Configure CPU hardware to communicate with the radio chip
@@ -323,7 +362,10 @@ lora_init(void)
    gpio_set_direction(CONFIG_RST_GPIO, GPIO_MODE_OUTPUT);
    gpio_reset_pin(CONFIG_CS_GPIO);
    gpio_set_direction(CONFIG_CS_GPIO, GPIO_MODE_OUTPUT);
+   gpio_set_level(CONFIG_CS_GPIO, 1);
 
+
+   ESP_LOGI(TAG, "Initializing SPI bus");
    spi_bus_config_t bus = {
       .miso_io_num = CONFIG_MISO_GPIO,
       .mosi_io_num = CONFIG_MOSI_GPIO,
@@ -332,9 +374,12 @@ lora_init(void)
       .quadhd_io_num = -1,
       .max_transfer_sz = 0
    };
-           
+
    ret = spi_bus_initialize(SPI3_HOST, &bus, 0);
-   assert(ret == ESP_OK);
+   if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "spi_bus_initialize failed: %s", esp_err_to_name(ret));
+      return 0;
+   }
 
    spi_device_interface_config_t dev = {
       .clock_speed_hz = 9000000,
@@ -342,27 +387,57 @@ lora_init(void)
       .spics_io_num = -1,
       .queue_size = 1,
       .flags = 0,
-      .pre_cb = NULL
+      .pre_cb = nullptr
    };
+   ESP_LOGI(TAG, "Adding SPI device");
    ret = spi_bus_add_device(SPI3_HOST, &dev, &__spi);
-   assert(ret == ESP_OK);
+   if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "spi_bus_add_device failed: %s", esp_err_to_name(ret));
+      spi_bus_free(SPI3_HOST);
+      return 0;
+   }
+
+   /* Create mutex to protect SPI transactions */
+   __spi_mutex = xSemaphoreCreateMutex();
+   if (__spi_mutex == NULL) {
+      ESP_LOGE(TAG, "Failed to create SPI mutex");
+      spi_bus_remove_device(__spi);
+      spi_bus_free(SPI3_HOST);
+      __spi = nullptr;
+      return 0;
+   }
 
    /*
     * Perform hardware reset.
     */
    lora_reset();
+   vTaskDelay(pdMS_TO_TICKS(50));
 
    /*
     * Check version.
     */
-   uint8_t version;
+   ESP_LOGI(TAG, "Checking LoRa version register");
+   uint8_t version = 0x00;
    uint8_t i = 0;
    while(i++ < TIMEOUT_RESET) {
       version = lora_read_reg(REG_VERSION);
-      if(version == 0x12) break;
+      // Support both SX1276-9 (0x12) and SX1262 (0xAA)
+      if(version == 0x12 || version == 0xAA) break;
       vTaskDelay(2);
    }
-   assert(i <= TIMEOUT_RESET + 1); // at the end of the loop above, the max value i can reach is TIMEOUT_RESET + 1
+   if (i >= TIMEOUT_RESET || (version != 0x12 && version != 0xAA)) {
+      ESP_LOGE(TAG, "LoRa module version check failed with supposed version 0x%02X after %d tries", version, i);
+      spi_bus_remove_device(__spi);
+      spi_bus_free(SPI3_HOST);
+      __spi = nullptr;
+      if (__spi_mutex) {
+         vSemaphoreDelete(__spi_mutex);
+         __spi_mutex = NULL;
+      }
+      return 0;
+   }
+
+   ESP_LOGI(TAG, "LoRa module version: 0x%02X", version);
 
    /*
     * Default configuration.
@@ -375,6 +450,7 @@ lora_init(void)
    lora_set_tx_power(17);
 
    lora_idle();
+   __initialized = true;
    return 1;
 }
 
@@ -391,20 +467,27 @@ lora_send_packet(uint8_t *buf, int size)
     * Lora FIFO can only be filled in standby mode
     */
    lora_idle(); 
-   lora_write_reg(REG_FIFO_ADDR_PTR, 0); 
+   lora_write_reg(REG_FIFO_ADDR_PTR, 0);
 
-   for(int i=0; i<size; i++) 
+   for(int i=0; i<size; i++)
       lora_write_reg(REG_FIFO, *buf++);
-   
+
    lora_write_reg(REG_PAYLOAD_LENGTH, size);
-   
+
    /*
     * Start transmission and wait for conclusion.
     * Data transmission is initiated by sending TX mode request.
     */
    lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_TX);
-   while((lora_read_reg(REG_IRQ_FLAGS) & IRQ_TX_DONE_MASK) == 0) // when TX Done is set break.
-      vTaskDelay(2);
+   TickType_t start = xTaskGetTickCount();
+   while((lora_read_reg(REG_IRQ_FLAGS) & IRQ_TX_DONE_MASK) == 0) { // when TX Done is set break.
+      if ((xTaskGetTickCount() - start) >= pdMS_TO_TICKS(LORA_TX_TIMEOUT_MS)) {
+         ESP_LOGE(TAG, "TX timeout after %d ms", LORA_TX_TIMEOUT_MS);
+         lora_idle();
+         return;
+      }
+      vTaskDelay(pdMS_TO_TICKS(2));
+   }
 
    lora_write_reg(REG_IRQ_FLAGS, IRQ_TX_DONE_MASK); // clear the TX Done flag in irq flag register
 }
@@ -437,10 +520,10 @@ lora_receive_packet(uint8_t *buf, int size)
    /*
     * Transfer data from radio.
     */
-   lora_idle();   
+   lora_idle();
    lora_write_reg(REG_FIFO_ADDR_PTR, lora_read_reg(REG_FIFO_RX_CURRENT_ADDR));
    if(len > size) len = size;
-   for(int i=0; i<len; i++) 
+   for(int i=0; i<len; i++)
       *buf++ = lora_read_reg(REG_FIFO);
 
    return len;
@@ -471,7 +554,7 @@ lora_packet_rssi(void)
 float 
 lora_packet_snr(void)
 {
-   return ((int8_t)lora_read_reg(REG_PKT_SNR_VALUE)) * 0.25;
+   return ((int8_t)lora_read_reg(REG_PKT_SNR_VALUE)) * 0.25f;
 }
 
 /**
@@ -480,13 +563,23 @@ lora_packet_snr(void)
 void 
 lora_close(void)
 {
+   if (!__initialized) {
+      return;
+   }
+
    lora_sleep();
-//   close(__spi);  FIXME: end hardware features after lora_close
-//   close(__cs);
-//   close(__rst);
-//   __spi = -1;
-//   __cs = -1;
-//   __rst = -1;
+   if (__spi != NULL) {
+      /* Ensure no other task is using SPI while we remove device */
+      if (__spi_mutex) xSemaphoreTake(__spi_mutex, portMAX_DELAY);
+      spi_bus_remove_device(__spi);
+      __spi = nullptr;
+      spi_bus_free(SPI3_HOST);
+      if (__spi_mutex) {
+         vSemaphoreDelete(__spi_mutex);
+         __spi_mutex = NULL;
+      }
+   }
+   __initialized = false;
 }
 
 void 
